@@ -1,0 +1,376 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <title>Web Serial VT100 Terminal</title>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/xterm@5.3.0/css/xterm.css" />
+  <script src="https://cdn.jsdelivr.net/npm/xterm@5.3.0/lib/xterm.js"></script>
+  <!-- 画面サイズ自動調整用 FitAddon -->
+  <script src="https://cdn.jsdelivr.net/npm/xterm-addon-fit@0.8.0/lib/xterm-addon-fit.js"></script>
+  <style>
+    body { font-family: sans-serif; background: #121212; color: #e0e0e0; margin: 0; padding: 15px; }
+    h1 { font-size: 1.3rem; margin: 0 0 10px; color: #00ff66; }
+    #controls { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 10px; align-items: center; }
+    #quick-send-controls { display: flex; gap: 8px; margin-bottom: 10px; align-items: center; }
+    select { background: #2a2a2a; color: #fff; border: 1px solid #444; padding: 6px 12px; border-radius: 4px; }
+    #selQuickHist { max-width: 400px; }
+    button { background: #2a2a2a; color: #fff; border: 1px solid #444; padding: 6px 12px; border-radius: 4px; cursor: pointer; }
+    button:disabled { opacity: 0.5; cursor: not-allowed; }
+    label { font-size: 0.85rem; cursor: pointer; display: flex; align-items: center; gap: 4px; }
+    
+    #terminal-container { 
+      width: 100%; 
+      height: 500px; 
+      min-height: 200px;
+      max-height: 90vh;
+      background: #000; 
+      border: 1px solid #333; 
+      padding: 4px; 
+      resize: vertical;
+      overflow: hidden;
+    }
+    .info { margin-top: 8px; margin-bottom: 8px; font-size: 0.8rem; color: #888; }
+  </style>
+</head>
+<body>
+  <h1>Web Serial VT100 Terminal</h1>
+  <div id="controls">
+    <label>ボーレート:
+      <select id="selBaudRate">
+        <option value="9600">9600</option>
+        <option value="19200">19200</option>
+        <option value="38400">38400</option>
+        <option value="57600">57600</option>
+        <option value="115200" selected>115200</option>
+        <option value="230400">230400</option>
+        <option value="460800">460800</option>
+        <option value="921600">921600</option>
+      </select>
+    </label>
+    <button id="btnConnect">接続</button>
+    <button id="btnDisconnect" disabled>切断</button>
+    <button id="btnSaveLog">ログ保存</button>
+    <button id="btnClearLog">ログ消去</button>
+    <button id="btnClearHist">履歴消去</button>
+    <label><input type="checkbox" id="chkTimestamp" checked> タイムスタンプ付与</label>
+  </div>
+  <div id="terminal-container"></div>
+  <div class="info">↑/↓: 履歴 | ←/→: カーソル移動 | Del/BS: 削除 | 右下ドラッグ: リサイズ</div>
+
+  <!-- 最新履歴クイック送信フォーム -->
+  <div id="quick-send-controls">
+    <select id="selQuickHist"></select>
+    <button id="btnQuickSend">送信</button>
+  </div>
+
+  <script>
+    /**
+     * @file web-serial-vt100-terminal.html
+     * @brief Web Serial API と Xterm.js を使用した VT100 ターミナル
+     * @copyright Copyright (c) 2026 Embedead-Inside
+     * @license SPDX-License-Identifier: MIT-0
+     */
+
+    const KEY = 'vt100_hist'; ///< ローカルストレージ保存用キー名
+    const MAX_HIST = 100;     ///< 最大保持ヒストリー件数
+
+    let port = null;          ///< SerialPort オブジェクト
+    let reader = null;        ///< SerialStream 読み取り用 Reader
+    let keepReading = false;  ///< ループ読み取り継続フラグ
+
+    let rawLogBuffer = [];    ///< ログ書き出し用文字列配列バッファ
+    let isNewLine = true;     ///< ログ書き込み時の行頭判定フラグ
+
+    let history = JSON.parse(localStorage.getItem(KEY) || '[]'); ///< コマンド履歴配列
+    let histIdx = history.length;                             ///< 現在参照中の履歴インデックス
+    let curBuf = '';                                          ///< 現在入力中のコマンドバッファ
+    let cursorPos = 0;                                        ///< 現在の入力行内カーソル位置
+
+    // Xterm.js インスタンスの生成と初期化
+    const term = new Terminal({
+      cursorBlink: true,
+      convertEol: true,
+      fontFamily: 'monospace',
+      fontSize: 14,
+      theme: { background: '#000', foreground: '#00ff66', cursor: '#00ff66' }
+    });
+    
+    const fitAddon = new FitAddon.FitAddon();
+    term.loadAddon(fitAddon);
+
+    const termContainer = document.getElementById('terminal-container');
+    term.open(termContainer);
+    fitAddon.fit();
+
+    term.focus();
+    term.writeln('=== Web Serial VT100 Terminal ===\r\n「接続」を押してデバイスを選択してください。\r\n');
+
+    // file:// スキームで開かれている場合の注意喚起
+    if (window.location.protocol === 'file:') {
+      term.writeln('[注意] 現在ファイル直接 (file://) で開かれています。ブラウザの仕様によりWeb Serial APIが制限される場合があるため、ローカルサーバー(http://localhost等)での実行を推奨します。\r\n');
+    }
+
+    const $ = id => document.getElementById(id);
+    const pad = (n, l=2) => String(n).padStart(l, '0');
+
+    // ResizeObserver のデバウンス対応（無限ループ・高負荷防止）
+    let resizeTimer = null;
+    const resizeObserver = new ResizeObserver(() => {
+      clearTimeout(resizeTimer);
+      resizeTimer = setTimeout(() => {
+        try { fitAddon.fit(); } catch (e) {}
+      }, 100);
+    });
+    resizeObserver.observe(termContainer);
+
+    $('btnConnect').onclick = async () => {
+      if (!('serial' in navigator)) return alert('Web Serial API非対応のブラウザです。');
+      
+      // file:// スキーム時の追加チェック（必要に応じてブロックまたは警告）
+      if (window.location.protocol === 'file:') {
+        console.warn('Running from file:// protocol. Web Serial API might be restricted.');
+      }
+
+      try {
+        const baudRate = Number($('selBaudRate').value);
+        port = await navigator.serial.requestPort();
+        
+        await port.open({
+          baudRate: baudRate,
+          dataBits: 8,
+          stopBits: 1,
+          parity: 'none'
+        });
+
+        toggleConn(true);
+        term.writeln(`\r\n[システム] 接続しました (${baudRate} bps, 8N1)。\r\n`);
+        keepReading = true;
+        readLoop();
+      } catch (e) { term.writeln(`\r\n[エラー] ${e.message}\r\n`); }
+      finally { term.focus(); }
+    };
+
+    $('btnDisconnect').onclick = async () => {
+      keepReading = false;
+      reader && await reader.cancel();
+      port && await port.close();
+      port = null;
+      toggleConn(false);
+      term.writeln('\r\n[システム] 切断しました。\r\n');
+      term.focus();
+    };
+
+    function toggleConn(connected) {
+      $('btnConnect').disabled = connected;
+      $('btnDisconnect').disabled = !connected;
+      $('selBaudRate').disabled = connected;
+    }
+
+    $('btnSaveLog').onclick = () => {
+      if (!rawLogBuffer.length) return alert('保存するログがありません。');
+      const blob = new Blob(rawLogBuffer, { type: 'text/plain;charset=utf-8' });
+      const a = document.createElement('a');
+      const d = new Date();
+      a.href = URL.createObjectURL(blob);
+      a.download = `serial_${d.getFullYear()}${pad(d.getMonth()+1)}${pad(d.getDate())}_${pad(d.getHours())}${pad(d.getMinutes())}${pad(d.getSeconds())}.log`;
+      a.click();
+      term.focus();
+    };
+
+    $('btnClearLog').onclick = () => {
+      rawLogBuffer = [];
+      isNewLine = true;
+      term.clear();
+      term.write('\x1b[H\x1b[2J');
+      term.writeln('[システム] ログバッファおよび画面表示を消去しました。\r\n');
+      term.focus();
+    };
+    
+    $('btnClearHist').onclick = () => { 
+      if (confirm('履歴を削除しますか？')) { 
+        localStorage.removeItem(KEY); 
+        history = []; 
+        histIdx = 0; 
+        updateQuickHistUI(); 
+        term.writeln('\r\n[システム] 履歴削除。\r\n'); 
+      } 
+      term.focus();
+    };
+
+    $('btnQuickSend').onclick = async () => {
+      const val = $('selQuickHist').value;
+      if (!val) return;
+      pushHist(val);
+      curBuf = '';
+      cursorPos = 0;
+      await send(val + '\r\n');
+      term.focus();
+    };
+
+    const textDecoder = new TextDecoder();
+    function appendLog(data) {
+      const clean = textDecoder.decode(data, { stream: true }).replace(/\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])/g, '');
+      if (!$('chkTimestamp').checked) return rawLogBuffer.push(clean);
+      
+      clean.split('\n').forEach((line, i, arr) => {
+        if (isNewLine && line) {
+          const d = new Date();
+          rawLogBuffer.push(`[${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}.${pad(d.getMilliseconds(), 3)}] `);
+          isNewLine = false;
+        }
+        rawLogBuffer.push(line);
+        if (i < arr.length - 1) { rawLogBuffer.push('\n'); isNewLine = true; }
+      });
+    }
+
+    async function readLoop() {
+      while (port?.readable && keepReading) {
+        try {
+          reader = port.readable.getReader();
+          while (true) {
+            const { value, done } = await reader.read();
+            if (done) break;
+            if (value) {
+              term.write(value);
+              appendLog(value);
+            }
+          }
+        } catch (e) { keepReading && term.writeln(`\r\n[エラー] ${e.message}\r\n`); }
+        finally { reader?.releaseLock(); }
+      }
+    }
+
+    async function send(txt) {
+      if (!port?.writable) return;
+      const w = port.writable.getWriter();
+      await w.write(new TextEncoder().encode(txt));
+      w.releaseLock();
+    }
+
+    /**
+     * @brief クイック送信ドロップダウンUIの更新（最新20件・重複排除）
+     */
+    function updateQuickHistUI() {
+      const sel = $('selQuickHist');
+      sel.innerHTML = '';
+      const unique = [...new Set([...history].reverse())].slice(0, 20);
+      if (!unique.length) {
+        sel.innerHTML = '<option value="">(履歴なし)</option>';
+        return;
+      }
+      unique.forEach(cmd => {
+        const opt = document.createElement('option');
+        opt.value = opt.textContent = cmd;
+        sel.appendChild(opt);
+      });
+    }
+
+    function pushHist(cmd) {
+      if (cmd && history[history.length - 1] !== cmd) {
+        history.push(cmd);
+        if (history.length > MAX_HIST) history.shift();
+        localStorage.setItem(KEY, JSON.stringify(history));
+      }
+      histIdx = history.length;
+      updateQuickHistUI();
+    }
+
+    function replaceInputText(newText) {
+      if (cursorPos > 0) {
+        term.write(`\x1b[${cursorPos}D`);
+      }
+      term.write('\x1b[K');
+
+      curBuf = newText;
+      cursorPos = curBuf.length;
+      term.write(curBuf);
+    }
+
+    term.onData(async data => {
+      if (!port?.writable) return;
+
+      // ↑ 履歴 (前へ)
+      if (data === '\x1b[A') {
+        if (histIdx > 0) histIdx--;
+        replaceInputText(history[histIdx] ?? '');
+        return;
+      }
+      // ↓ 履歴 (次へ)
+      if (data === '\x1b[B') {
+        if (histIdx < history.length) histIdx++;
+        replaceInputText(history[histIdx] ?? '');
+        return;
+      }
+      // → カーソル右
+      if (data === '\x1b[C') {
+        if (cursorPos < curBuf.length) {
+          cursorPos++;
+          term.write('\x1b[C');
+        }
+        return;
+      }
+      // ← カーソル左
+      if (data === '\x1b[D') {
+        if (cursorPos > 0) {
+          cursorPos--;
+          term.write('\x1b[D');
+        }
+        return;
+      }
+      // Del キー (\x1b[3~)
+      if (data === '\x1b[3~') {
+        if (cursorPos < curBuf.length) {
+          const left = curBuf.slice(0, cursorPos);
+          const right = curBuf.slice(cursorPos + 1);
+          curBuf = left + right;
+          
+          term.write(right + ' \x1b[' + (right.length + 1) + 'D');
+        }
+        return;
+      }
+
+      for (const c of data) {
+        const code = c.charCodeAt(0);
+        if (code === 13 || code === 10) { // Enter
+          const trimmed = curBuf.trim();
+          if (trimmed) {
+            term.write('\r\n');
+            pushHist(trimmed);
+            await send(curBuf + '\r\n');
+          } else {
+            await send('\r\n');
+          }
+          curBuf = '';
+          cursorPos = 0;
+        } else if (code === 127 || code === 8) { // Backspace
+          if (cursorPos > 0) {
+            const left = curBuf.slice(0, cursorPos - 1);
+            const right = curBuf.slice(cursorPos);
+            curBuf = left + right;
+            cursorPos--;
+            
+            term.write('\x1b[D' + right + ' \x1b[' + (right.length + 1) + 'D');
+          }
+        } else if (code >= 32) { // 通常文字の挿入
+          const left = curBuf.slice(0, cursorPos);
+          const right = curBuf.slice(cursorPos);
+          curBuf = left + c + right;
+          cursorPos++;
+          
+          term.write(c + right);
+          if (right.length > 0) {
+            term.write(`\x1b[${right.length}D`);
+          }
+        } else if (code === 3) { // Ctrl+C
+          curBuf = '';
+          cursorPos = 0;
+          term.write('^C\r\n');
+          await send('\x03');
+        }
+      }
+    });
+
+    updateQuickHistUI();
+  </script>
+</body>
+</html>
