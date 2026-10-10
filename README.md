@@ -1,6 +1,6 @@
 # Web Serial VT100 Terminal
 
-Web Serial API と [Xterm.js](https://xtermjs.org/) をベースとし、**「ターミナル（ブラウザ）側にコマンド履歴およびデバッグログ保存機能を持たせる」**ことで、組み込み機器側のCLI・デバッグロジックを極限までシンプルに保てるよう設計されています。
+Web Serial API と [Xterm.js](https://xtermjs.org/) をベースとし、 **「ターミナル（ブラウザ）側にコマンド履歴およびデバッグログ保存機能を持たせる」** ことで、組み込み機器側のCLI・デバッグロジックを極限までシンプルに保てるよう設計されています。
 
 ![License: MIT-0](https://img.shields.io/badge/License-MIT--0-blue.svg)
 
