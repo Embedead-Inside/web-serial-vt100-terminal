@@ -4,6 +4,8 @@ Web Serial API と [Xterm.js](https://xtermjs.org/) をベースとし、**「�
 
 ![License: MIT-0](https://img.shields.io/badge/License-MIT--0-blue.svg)
 
+![Web Serial VT100 Terminal](https://raw.githubusercontent.com/Embedead-Inside/web-serial-vt100-terminal/refs/heads/main/web-serial-vt100-terminal.png)
+
 ---
 
 ## 主な機能
