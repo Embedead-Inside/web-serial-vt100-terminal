@@ -203,24 +203,58 @@
       pushHist(val);
       curBuf = '';
       cursorPos = 0;
-      await send(val + '\r\n');
+      await send(val + '\n');
       term.focus();
     };
 
     const textDecoder = new TextDecoder();
-    function appendLog(data) {
-      const clean = textDecoder.decode(data, { stream: true }).replace(/\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])/g, '');
-      if (!$('chkTimestamp').checked) return rawLogBuffer.push(clean);
-      
-      clean.split('\n').forEach((line, i, arr) => {
-        if (isNewLine && line) {
-          const d = new Date();
-          rawLogBuffer.push(`[${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}.${pad(d.getMilliseconds(), 3)}] `);
-          isNewLine = false;
+    
+    /**
+     * @brief 受信データを処理し、必要に応じてタイムスタンプを付与しながら画面とログバッファへ反映する
+     */
+    function handleIncomingData(value) {
+      const decoded = textDecoder.decode(value, { stream: true });
+      const clean = decoded.replace(/\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])/g, '');
+
+      // 1. ログバッファ用の処理（従来通りチェックボックスの状態に連動）
+      if (!$('chkTimestamp').checked) {
+        rawLogBuffer.push(clean);
+      } else {
+        clean.split('\n').forEach((line, i, arr) => {
+          if (isNewLine && line) {
+            const d = new Date();
+            rawLogBuffer.push(`[${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}.${pad(d.getMilliseconds(), 3)}] `);
+            isNewLine = false;
+          }
+          rawLogBuffer.push(line);
+          if (i < arr.length - 1) { rawLogBuffer.push('\n'); isNewLine = true; }
+        });
+      }
+
+      // 2. 画面（Xterm.js）への出力処理（チェックボックスがONならタイムスタンプを挿入して表示）
+      if ($('chkTimestamp').checked) {
+        // ターミナル表示用にタイムスタンプ付きの文字列を組み立てて書き込む
+        let outputStr = '';
+        for (let i = 0; i < decoded.length; i++) {
+          const char = decoded[i];
+          if (window._termIsNewLine === undefined) window._termIsNewLine = true;
+
+          if (window._termIsNewLine && char !== '\r' && char !== '\n') {
+            const d = new Date();
+            outputStr += `[${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}.${pad(d.getMilliseconds(), 3)}] `;
+            window._termIsNewLine = false;
+          }
+          outputStr += char;
+          if (char === '\n') {
+            window._termIsNewLine = true;
+          }
         }
-        rawLogBuffer.push(line);
-        if (i < arr.length - 1) { rawLogBuffer.push('\n'); isNewLine = true; }
-      });
+        term.write(outputStr);
+      } else {
+        // OFFの場合はそのまま素のデータをターミナルに渡す
+        window._termIsNewLine = true; // OFFからONに戻した時のためにリセット
+        term.write(decoded);
+      }
     }
 
     async function readLoop() {
@@ -231,8 +265,7 @@
             const { value, done } = await reader.read();
             if (done) break;
             if (value) {
-              term.write(value);
-              appendLog(value);
+              handleIncomingData(value);
             }
           }
         } catch (e) { keepReading && term.writeln(`\r\n[エラー] ${e.message}\r\n`); }
@@ -336,9 +369,9 @@
           if (trimmed) {
             term.write('\r\n');
             pushHist(trimmed);
-            await send(curBuf + '\r\n');
+            await send(curBuf + '\n');
           } else {
-            await send('\r\n');
+            await send('\n');
           }
           curBuf = '';
           cursorPos = 0;
