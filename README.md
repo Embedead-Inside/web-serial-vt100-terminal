@@ -49,4 +49,3 @@ Web Serial API と [Xterm.js](https://xtermjs.org/) をベースとし、 **「�
 - 著作権表示やライセンス文言の保持・記載義務すらありません。
 - ソースコードの改変、流用、再配布、自社製品への組み込み等、制限なくご活用いただけます。
 
-<p align="right"><small><a name="note" class="muted-link">※一部AIによる生成・調整コードが含まれることがあります。</a></small></p>
