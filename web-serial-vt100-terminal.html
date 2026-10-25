@@ -3,11 +3,15 @@
 <head>
   <meta charset="UTF-8">
   <title>Web Serial VT100 Terminal</title>
+  <!-- @brief Xterm.js のスタイルシート読み込み (CDN) -->
   <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/xterm@5.3.0/css/xterm.css" />
+  <!-- @brief Xterm.js 本体および FitAddon（画面サイズ自動調整）の読み込み (CDN) -->
   <script src="https://cdn.jsdelivr.net/npm/xterm@5.3.0/lib/xterm.js"></script>
-  <!-- 画面サイズ自動調整用 FitAddon -->
   <script src="https://cdn.jsdelivr.net/npm/xterm-addon-fit@0.8.0/lib/xterm-addon-fit.js"></script>
   <style>
+    /**
+     * @brief 全体レイアウト・カラー設定（ダークモード基調）
+     */
     body { font-family: sans-serif; background: #121212; color: #e0e0e0; margin: 0; padding: 15px; }
     h1 { font-size: 1.3rem; margin: 0 0 10px; color: #00ff66; }
     #controls { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 10px; align-items: center; }
@@ -18,6 +22,10 @@
     button:disabled { opacity: 0.5; cursor: not-allowed; }
     label { font-size: 0.85rem; cursor: pointer; display: flex; align-items: center; gap: 4px; }
     
+    /**
+     * @brief ターミナル表示コンテナの設定
+     * @note 縦方向のみドラッグでリサイズ可能 (ResizeObserver 経由で FitAddon が追従)
+     */
     #terminal-container { 
       width: 100%; 
       height: 500px; 
@@ -29,11 +37,22 @@
       resize: vertical;
       overflow: hidden;
     }
+    
+    /**
+     * @brief ターミナル内のテキスト選択を確実に有効化するスタイル
+     */
+    #terminal-container, .xterm-accessibility, .xterm-text-layer, .xterm-selection-layer {
+      user-select: text !important;
+      -webkit-user-select: text !important;
+    }
+
     .info { margin-top: 8px; margin-bottom: 8px; font-size: 0.8rem; color: #888; }
   </style>
 </head>
 <body>
   <h1>Web Serial VT100 Terminal</h1>
+  
+  <!-- @brief コントロールボタン群 (ボーレート選択 / 接続 / ログ操作 / タイムスタンプ切替) -->
   <div id="controls">
     <label>ボーレート:
       <select id="selBaudRate">
@@ -54,10 +73,12 @@
     <button id="btnClearHist">履歴消去</button>
     <label><input type="checkbox" id="chkTimestamp" checked> タイムスタンプ付与</label>
   </div>
+  
+  <!-- @brief ターミナル描画領域 (Xterm.js がここに描画される) -->
   <div id="terminal-container"></div>
-  <div class="info">↑/↓: 履歴 | ←/→: カーソル移動 | Del/BS: 削除 | 右下ドラッグ: リサイズ</div>
+  <div class="info">↑/↓: 履歴 | ←/→: カーソル移動 | ドラッグ選択 & Ctrl+C: コピー | 未選択時 Ctrl+C: キャンセル</div>
 
-  <!-- 最新履歴クイック送信フォーム -->
+  <!-- @brief クイック送信セクション (履歴プルダウンから選んで送信) -->
   <div id="quick-send-controls">
     <select id="selQuickHist"></select>
     <button id="btnQuickSend">送信</button>
@@ -67,34 +88,84 @@
     /**
      * @file web-serial-vt100-terminal.html
      * @brief Web Serial API と Xterm.js を使用した VT100 ターミナル
+     * @details
+     * ブラウザだけでシリアルデバイスと対話するための単一ファイル製ターミナル。
+     * 主な機能は次のとおり。
+     *  - 行編集 (←/→/Delete/Backspace) とコマンド履歴 (↑/↓、プルダウンからのクイック送信)
+     *  - 受信行の行頭へのタイムスタンプ付与と、ログファイル保存
+     *  - 自分が送信したコマンドのエコーバック除去と、空行の抑止
+     *
+     * @par 改行コードの扱い
+     *  - 送信: LF(\n) のみ (CR は送らない)
+     *  - 受信: CR(\r) はすべて破棄し、LF(\n) のみを行区切りとして扱う
+     *
+     * @par 動作環境
+     *  Web Serial API に対応したブラウザ (Chrome / Edge 等) が必要。
+     *  file:// では制限される場合があるため、http://localhost 等での実行を推奨する。
+     *
+     * @par コメント規約 (修正する方へ)
+     *  - 関数・イベントハンドラ・グローバル変数は、`/**` で始まる Doxygen 形式のブロックコメントで記述する
+     *    (@brief / @details / @param / @return / @note / @warning 等を使用)
+     *  - 変数の説明は、宣言行の末尾に `///<` で記述する
+     *  - 関連する宣言は defgroup コマンドでグループ化し、末尾に `end of grp_xxx` の目印コメントを付ける
+     *  - 関数内部の補足説明は、通常の `//` コメントで記述する
+     *
      * @copyright Copyright (c) 2026 Embedead-Inside
      * @license SPDX-License-Identifier: MIT-0
      */
 
-    const KEY = 'vt100_hist'; ///< ローカルストレージ保存用キー名
-    const MAX_HIST = 100;     ///< 最大保持ヒストリー件数
+    /**
+     * @defgroup grp_config 定数・状態管理変数
+     * @brief アプリ全体で共有する定数とグローバル状態
+     * @{
+     */
 
-    let port = null;          ///< SerialPort オブジェクト
-    let reader = null;        ///< SerialStream 読み取り用 Reader
-    let keepReading = false;  ///< ループ読み取り継続フラグ
+    // ---- 定数 ----
+    const LOCAL_STORAGE_KEY = 'vt100_hist'; ///< ローカルストレージ保存用キー名
+    const MAX_HISTORY_COUNT = 100;          ///< 最大保持ヒストリー件数
 
-    let rawLogBuffer = [];    ///< ログ書き出し用文字列配列バッファ
-    let isNewLine = true;     ///< ログ書き込み時の行頭判定フラグ
+    // ---- 状態管理変数 ----
+    let serialPort = null;          ///< SerialPort オブジェクト
+    let serialReader = null;        ///< SerialStream 読み取り用 Reader
+    let keepReadingFlag = false;    ///< ループ読み取り継続フラグ
 
-    let history = JSON.parse(localStorage.getItem(KEY) || '[]'); ///< コマンド履歴配列
-    let histIdx = history.length;                             ///< 現在参照中の履歴インデックス
-    let curBuf = '';                                          ///< 現在入力中のコマンドバッファ
-    let cursorPos = 0;                                        ///< 現在の入力行内カーソル位置
+    let rawLogBuffer = [];          ///< ログファイル保存用の文字列配列バッファ
+    let commandHistory = JSON.parse(localStorage.getItem(LOCAL_STORAGE_KEY) || '[]'); ///< コマンド履歴配列
+    let historyIndex = commandHistory.length;                                        ///< 現在参照中の履歴インデックス
+    let currentInputBuffer = '';                                                     ///< 現在入力中のコマンド文字列バッファ
+    let currentCursorPos = 0;                                                        ///< 現在の入力行内カーソル位置
 
-    // Xterm.js インスタンスの生成と初期化
+    let expectedEchoString = '';    ///< 相手から返ってくる予定のエコー文字列（自動除外用）
+
+    /**
+     * @par 行状態管理 (window のプロパティとして保持)
+     * @note 初回参照時は undefined のため、使用箇所で未定義チェックを行っている
+     *  - window._termIsNewLine        : ログ上で次の文字が行頭か (true = 行頭)
+     *  - window._currentLineCharCount : 現在のログ行の文字数 (行頭のタイムスタンプは含まない)
+     */
+
+    /** @} */ // end of grp_config
+
+    /**
+     * @defgroup grp_term ターミナル初期化・ユーティリティ
+     * @brief Xterm.js の生成・初期表示・サイズ追従と、共通ヘルパー
+     * @{
+     */
+
+    /**
+     * @brief Xterm.js インスタンス
+     * @details スクロールバックは 30000 行に拡張している。convertEol により LF のみでも行頭へ戻る。
+     */
     const term = new Terminal({
       cursorBlink: true,
       convertEol: true,
       fontFamily: 'monospace',
       fontSize: 14,
+      scrollback: 30000, 
       theme: { background: '#000', foreground: '#00ff66', cursor: '#00ff66' }
     });
     
+    // 画面サイズ自動フィット用アドオンの適用 (コンテナ寸法に合わせて桁数・行数を再計算する)
     const fitAddon = new FitAddon.FitAddon();
     term.loadAddon(fitAddon);
 
@@ -105,15 +176,30 @@
     term.focus();
     term.writeln('=== Web Serial VT100 Terminal ===\r\n「接続」を押してデバイスを選択してください。\r\n');
 
-    // file:// スキームで開かれている場合の注意喚起
+    // file:// プロトコル実行時の警告表示
     if (window.location.protocol === 'file:') {
       term.writeln('[注意] 現在ファイル直接 (file://) で開かれています。ブラウザの仕様によりWeb Serial APIが制限される場合があるため、ローカルサーバー(http://localhost等)での実行を推奨します。\r\n');
     }
 
+    /**
+     * @brief document.getElementById の短縮形
+     * @param {string} id 要素の id
+     * @return {HTMLElement} 該当要素
+     */
     const $ = id => document.getElementById(id);
+
+    /**
+     * @brief 数値をゼロ埋めした文字列にする (日時の整形用)
+     * @param {number} n 対象の数値
+     * @param {number} [l=2] 桁数
+     * @return {string} ゼロ埋め後の文字列 (例: pad(5) → "05", pad(7, 3) → "007")
+     */
     const pad = (n, l=2) => String(n).padStart(l, '0');
 
-    // ResizeObserver のデバウンス対応（無限ループ・高負荷防止）
+    /**
+     * @brief ウィンドウ/コンテナのサイズ変更時にターミナルを自動リサイズする
+     * @details 連続発火を避けるため 100ms のデバウンスを入れている。
+     */
     let resizeTimer = null;
     const resizeObserver = new ResizeObserver(() => {
       clearTimeout(resizeTimer);
@@ -123,49 +209,85 @@
     });
     resizeObserver.observe(termContainer);
 
+    /** @} */ // end of grp_term
+
+    /**
+     * @defgroup grp_conn シリアル接続・切断
+     * @brief 接続/切断ボタンのイベントハンドラと UI 状態切替
+     * @{
+     */
+
+    /**
+     * @brief 「接続」ボタン押下時の処理
+     * @details ポート選択ダイアログを表示し、選択されたポートを 8N1 で開いて受信ループを開始する。
+     * @note Web Serial API 非対応ブラウザではアラートを出して終了する。
+     */
     $('btnConnect').onclick = async () => {
       if (!('serial' in navigator)) return alert('Web Serial API非対応のブラウザです。');
-      
-      // file:// スキーム時の追加チェック（必要に応じてブロックまたは警告）
-      if (window.location.protocol === 'file:') {
-        console.warn('Running from file:// protocol. Web Serial API might be restricted.');
-      }
 
       try {
         const baudRate = Number($('selBaudRate').value);
-        port = await navigator.serial.requestPort();
+        serialPort = await navigator.serial.requestPort();
         
-        await port.open({
+        await serialPort.open({
           baudRate: baudRate,
           dataBits: 8,
           stopBits: 1,
           parity: 'none'
         });
 
-        toggleConn(true);
+        toggleConnectionUI(true);
         term.writeln(`\r\n[システム] 接続しました (${baudRate} bps, 8N1)。\r\n`);
-        keepReading = true;
+        screenAtLineStart = true;
+        keepReadingFlag = true;
         readLoop();
-      } catch (e) { term.writeln(`\r\n[エラー] ${e.message}\r\n`); }
-      finally { term.focus(); }
+      } catch (e) {
+        term.writeln(`\r\n[エラー] ${e.message}\r\n`);
+      } finally {
+        term.focus();
+      }
     };
 
+    /**
+     * @brief 「切断」ボタン押下時の処理
+     * @details 受信ループを止め、Reader のキャンセルとポートのクローズを行う。
+     */
     $('btnDisconnect').onclick = async () => {
-      keepReading = false;
-      reader && await reader.cancel();
-      port && await port.close();
-      port = null;
-      toggleConn(false);
+      keepReadingFlag = false;
+      if (serialReader) {
+        await serialReader.cancel();
+      }
+      if (serialPort) {
+        await serialPort.close();
+        serialPort = null;
+      }
+      toggleConnectionUI(false);
       term.writeln('\r\n[システム] 切断しました。\r\n');
       term.focus();
     };
 
-    function toggleConn(connected) {
-      $('btnConnect').disabled = connected;
-      $('btnDisconnect').disabled = !connected;
-      $('selBaudRate').disabled = connected;
+    /**
+     * 接続状態に応じてUIボタン等の有効/無効を切り替える
+     * @param {boolean} isConnected 接続状態
+     */
+    function toggleConnectionUI(isConnected) {
+      $('btnConnect').disabled = isConnected;
+      $('btnDisconnect').disabled = !isConnected;
+      $('selBaudRate').disabled = isConnected;
     }
 
+    /** @} */ // end of grp_conn
+
+    /**
+     * @defgroup grp_buttons ログ・履歴操作ボタン
+     * @brief ログ保存/消去、履歴消去、クイック送信のイベントハンドラ
+     * @{
+     */
+
+    /**
+     * @brief 「ログ保存」ボタン押下時の処理
+     * @details ログバッファを `serial_YYYYMMDD_hhmmss.log` としてダウンロードする。
+     */
     $('btnSaveLog').onclick = () => {
       if (!rawLogBuffer.length) return alert('保存するログがありません。');
       const blob = new Blob(rawLogBuffer, { type: 'text/plain;charset=utf-8' });
@@ -177,116 +299,324 @@
       term.focus();
     };
 
+    /**
+     * @brief 「ログ消去」ボタン押下時の処理
+     * @details ログバッファと画面表示 (スクロールバック含む) を消去する。
+     */
     $('btnClearLog').onclick = () => {
       rawLogBuffer = [];
-      isNewLine = true;
       term.clear();
       term.write('\x1b[H\x1b[2J');
       term.writeln('[システム] ログバッファおよび画面表示を消去しました。\r\n');
+      screenAtLineStart = true;
       term.focus();
     };
     
+    /**
+     * @brief 「履歴消去」ボタン押下時の処理
+     * @details 確認ダイアログで承諾された場合のみ、コマンド履歴 (localStorage 含む) を削除する。
+     */
     $('btnClearHist').onclick = () => { 
       if (confirm('履歴を削除しますか？')) { 
-        localStorage.removeItem(KEY); 
-        history = []; 
-        histIdx = 0; 
+        localStorage.removeItem(LOCAL_STORAGE_KEY); 
+        commandHistory = []; 
+        historyIndex = 0; 
         updateQuickHistUI(); 
         term.writeln('\r\n[システム] 履歴削除。\r\n'); 
       } 
       term.focus();
     };
 
+    /**
+     * @brief 「送信」ボタン押下時の処理 (プルダウンからのクイック送信)
+     * @details 選択中のコマンドを履歴・ログへ記録し、LF(\n) のみを付けて送信する。
+     * @note 画面にはコマンドを表示しない (エコーバックは除去されるため)。ログにのみ記録される。
+     */
     $('btnQuickSend').onclick = async () => {
       const val = $('selQuickHist').value;
       if (!val) return;
-      pushHist(val);
-      curBuf = '';
-      cursorPos = 0;
-      await send(val + '\n');
+      pushHistory(val);
+      expectedEchoString = val;
+      logUserCommand(val);
+      currentInputBuffer = '';
+      currentCursorPos = 0;
+      await sendDataToSerial(val + '\n');
       term.focus();
     };
 
-    const textDecoder = new TextDecoder();
-    
+    /** @} */ // end of grp_buttons
+
     /**
-     * @brief 受信データを処理し、必要に応じてタイムスタンプを付与しながら画面とログバッファへ反映する
+     * @defgroup grp_rx 受信データ処理・タイムスタンプ・ログ記録
+     * @brief 受信データの整形 (CR破棄・エコー除去・空行抑止) と、画面/ログへの出力
+     * @details
+     * 画面 (Xterm) とログ (rawLogBuffer) は別々に行状態を管理する。
+     *  - 画面: screenAtLineStart で「カーソルが行頭か」を追跡し、行頭での LF を捨てて空行を防ぐ
+     *  - ログ: window._termIsNewLine で「次の文字が行頭か」を追跡し、空行を記録しない
+     * @{
      */
-    function handleIncomingData(value) {
-      const decoded = textDecoder.decode(value, { stream: true });
-      const clean = decoded.replace(/\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])/g, '');
 
-      // 1. ログバッファ用の処理（従来通りチェックボックスの状態に連動）
-      if (!$('chkTimestamp').checked) {
-        rawLogBuffer.push(clean);
+    const textDecoder = new TextDecoder(); ///< 受信バイト列のデコーダ (stream:true でマルチバイト分断に対応)
+
+    let lastAssignedMs = 0;          ///< 直近に付与したタイムスタンプ (epoch ms)。単調増加を保つための基準
+    let lastLineLen = 0;             ///< 直前に確定した行の文字数。一括受信時の推定受信時間の計算に使う
+    let screenAtLineStart = true;    ///< 画面上のカーソルが行頭にあるか（空行抑止用）
+    /**
+     * @brief 改行前（未確定）の行が持つ行頭タイムスタンプの情報
+     * @details `{logIdx: number, stamp: string}`。logIdx は rawLogBuffer 内の位置。
+     *          Enter 送信時刻への差し替え (restampPromptLine) に使う。該当なしは null。
+     */
+    let promptLine = null;
+
+    /**
+     * @brief 次の行頭に付与するタイムスタンプ文字列を生成する（受信間隔の補正込み）
+     * @details
+     * 一括で届いた複数行が同一時刻にならないよう、前行の時刻から推定受信時間
+     * (行の文字数 / 15 ms、最低 1ms) だけ進めた値と現在時刻の遅いほうを採用する。
+     * これにより、順序は保たれ、実時間が先に進んでいれば必ず現在時刻に追従する。
+     * @return {string} 固定幅 26 文字のタイムスタンプ文字列 (末尾に空白を含む)
+     * @note 呼び出すたびに lastAssignedMs が更新される。
+     */
+    function nextStamp() {
+      const nowMs = Date.now();
+      let targetMs;
+
+      if (lastAssignedMs === 0) {
+        targetMs = nowMs;
       } else {
-        clean.split('\n').forEach((line, i, arr) => {
-          if (isNewLine && line) {
-            const d = new Date();
-            rawLogBuffer.push(`[${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}.${pad(d.getMilliseconds(), 3)}] `);
-            isNewLine = false;
-          }
-          rawLogBuffer.push(line);
-          if (i < arr.length - 1) { rawLogBuffer.push('\n'); isNewLine = true; }
-        });
+        const neededMs = Math.max(1, Math.floor(lastLineLen / 15));
+        // 一括受信された行は前行から推定受信時間ぶん進めて順序を保ち、
+        // 実際の現在時刻のほうが新しければ必ず現在時刻を採用する
+        targetMs = Math.max(nowMs, lastAssignedMs + neededMs);
       }
 
-      // 2. 画面（Xterm.js）への出力処理（チェックボックスがONならタイムスタンプを挿入して表示）
-      if ($('chkTimestamp').checked) {
-        // ターミナル表示用にタイムスタンプ付きの文字列を組み立てて書き込む
-        let outputStr = '';
-        for (let i = 0; i < decoded.length; i++) {
-          const char = decoded[i];
-          if (window._termIsNewLine === undefined) window._termIsNewLine = true;
-
-          if (window._termIsNewLine && char !== '\r' && char !== '\n') {
-            const d = new Date();
-            outputStr += `[${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}.${pad(d.getMilliseconds(), 3)}] `;
-            window._termIsNewLine = false;
-          }
-          outputStr += char;
-          if (char === '\n') {
-            window._termIsNewLine = true;
-          }
-        }
-        term.write(outputStr);
-      } else {
-        // OFFの場合はそのまま素のデータをターミナルに渡す
-        window._termIsNewLine = true; // OFFからONに戻した時のためにリセット
-        term.write(decoded);
-      }
+      lastAssignedMs = targetMs;
+      return formatStamp(targetMs);
     }
 
+    /**
+     * @brief ミリ秒値を固定幅(26文字)のタイムスタンプ文字列にする
+     * @param {number} ms epoch ミリ秒
+     * @return {string} `[YYYY-MM-DD hh:mm:ss.mmm] ` 形式の文字列 (ローカル時刻、末尾に空白)
+     * @note 画面上の上書き (restampPromptLine) は幅が同じであることを前提にしている。
+     */
+    function formatStamp(ms) {
+      const d = new Date(ms);
+      return `[${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}.${pad(d.getMilliseconds(), 3)}] `;
+    }
+
+    /**
+     * @brief 未確定のプロンプト行の行頭タイムスタンプを、コマンド送信(Enter)時刻へ差し替える
+     * @details
+     * 例: `[10:00:00.000] ECLI> ` → `[10:00:08.000] ECLI> ` （画面・ログの両方）
+     *  - ログ: rawLogBuffer 内の該当チャンクの文字列を置換する
+     *  - 画面: カーソル位置を保存し、折り返し行なら論理行の先頭行まで戻って
+     *          同じ幅で上書きしたあと、元の位置へカーソルを復帰する
+     * @warning 画面側は現在のカーソル行を基準にするため、必ず改行(\r\n)を出力する前に呼ぶこと。
+     * @note タイムスタンプ無効時、未確定行がない場合は何もしない。
+     */
+    function restampPromptLine() {
+      if (!$('chkTimestamp').checked || !promptLine || window._termIsNewLine) return;
+
+      const ms = Math.max(Date.now(), lastAssignedMs);
+      lastAssignedMs = ms;
+      const newStamp = formatStamp(ms);
+
+      // ログ側: 記録済みチャンク内の該当タイムスタンプを置換
+      const chunk = rawLogBuffer[promptLine.logIdx];
+      if (typeof chunk === 'string') {
+        const pos = chunk.lastIndexOf(promptLine.stamp);
+        if (pos >= 0) {
+          rawLogBuffer[promptLine.logIdx] = chunk.slice(0, pos) + newStamp + chunk.slice(pos + promptLine.stamp.length);
+        }
+      }
+
+      // 画面側: 折り返し行なら論理行の先頭行まで戻り、同じ幅で上書きしてカーソルを復帰
+      const buf = term.buffer.active;
+      let abs = buf.baseY + buf.cursorY;
+      let rows = 0;
+      while (buf.getLine(abs)?.isWrapped) { abs--; rows++; }
+      if (rows <= buf.cursorY) {
+        term.write('\x1b7' + (rows ? `\x1b[${rows}A` : '') + '\r' + newStamp + '\x1b8');
+      }
+
+      promptLine.stamp = newStamp;
+    }
+
+    /**
+     * @brief ユーザーが入力・送信したコマンドをログバッファへ記録する
+     * @details
+     * プロンプト行の続きに追記して行を確定させる。プロンプト行がない場合は
+     * 新しい行として (必要ならタイムスタンプ付きで) 記録する。
+     * @param {string} text 送信したコマンド文字列 (改行は含まない)
+     * @warning 内部で restampPromptLine() を呼ぶため、画面の改行より前に呼ぶこと。
+     */
+    function logUserCommand(text) {
+      if (window._termIsNewLine === undefined) window._termIsNewLine = true;
+      restampPromptLine();
+      let out = '';
+      if (window._termIsNewLine) {
+        if ($('chkTimestamp').checked) out += nextStamp();
+        window._currentLineCharCount = 0;
+      }
+      out += text + '\n';
+      lastLineLen = (window._currentLineCharCount || 0) + text.length;
+      window._termIsNewLine = true;
+      rawLogBuffer.push(out);
+    }
+
+    /**
+     * @brief 受信データを処理し、ターミナルへの出力とログバッファへの蓄積を行う
+     * @details
+     * 処理の流れ:
+     *  -# デコードし、CR(\r) をすべて破棄する
+     *  -# 直前に送信したコマンドのエコーバックを除去する (分割到着にも対応)
+     *  -# 1文字ずつ走査して、画面用文字列とログ用文字列を組み立てる
+     *     - LF: 画面は行頭なら出力せず、ログも空行は記録しない
+     *     - 行頭の最初の文字: タイムスタンプを付与する (有効時)
+     *  -# ログにはエスケープシーケンスを除去して保存し、画面へ出力する
+     * @param {Uint8Array} value 受信バイトデータ
+     * @see expectedEchoString, screenAtLineStart, promptLine
+     */
+    function handleIncomingData(value) {
+      let decoded = textDecoder.decode(value, { stream: true });
+      
+      // 1. 相手から送られてくる CR(\r) はすべて読み捨てる（破棄）
+      decoded = decoded.replace(/\r/g, '');
+
+      // 2. 自分が送信したコマンドのエコーバックが返ってきた場合、それを削って画面に表示させない
+      //    (完全一致 / 前方一致 / 1文字ずつ等の分割到着 / 無関係データ の4通りを判定)
+      if (expectedEchoString) {
+        const trimmedDecoded = decoded.trim();
+        if (trimmedDecoded === expectedEchoString || trimmedDecoded.startsWith(expectedEchoString)) {
+          decoded = decoded.replace(expectedEchoString, '');
+          expectedEchoString = '';
+        } else if (expectedEchoString.includes(trimmedDecoded)) {
+          expectedEchoString = expectedEchoString.slice(trimmedDecoded.length);
+          decoded = '';
+        } else {
+          expectedEchoString = '';
+        }
+      }
+
+      if (!decoded) return;
+
+      // 3. 画面用・ログ用の文字列を組み立てる
+      const useStamp = $('chkTimestamp').checked;
+      let screenStr = ''; // 画面表示用
+      let logStr = '';    // ログ保存用
+      let chunkStamp = null; // このチャンクで付けた、未確定行のタイムスタンプ
+
+      for (let i = 0; i < decoded.length; i++) {
+        const char = decoded[i];
+        if (window._termIsNewLine === undefined) window._termIsNewLine = true;
+
+        if (char === '\n') {
+          // 画面: すでに行頭なら改行を出さない（空行を作らない）
+          if (!screenAtLineStart) {
+            screenStr += '\n';
+            screenAtLineStart = true;
+          }
+          // ログ: 空行は記録しない（行末の改行のみ記録）
+          if (!window._termIsNewLine) {
+            logStr += '\n';
+            lastLineLen = window._currentLineCharCount || 0;
+            window._termIsNewLine = true;
+          }
+          promptLine = null;
+          chunkStamp = null;
+          continue;
+        }
+
+        // 行頭の最初の文字でタイムスタンプを付与
+        if (window._termIsNewLine) {
+          if (useStamp) {
+            const stamp = nextStamp();
+            screenStr += stamp;
+            logStr += stamp;
+            chunkStamp = stamp;
+          }
+          window._currentLineCharCount = 0;
+          window._termIsNewLine = false;
+        }
+
+        screenStr += char;
+        logStr += char;
+        screenAtLineStart = false;
+        window._currentLineCharCount = (window._currentLineCharCount || 0) + 1;
+      }
+
+      // 4. ログへ保存（エスケープシーケンスは除去）し、画面へ出力する
+      rawLogBuffer.push(logStr.replace(/\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])/g, ''));
+      // 行が未確定のまま終わった場合は、その行頭タイムスタンプを差し替え用に記憶する
+      if (chunkStamp && !window._termIsNewLine) {
+        promptLine = { logIdx: rawLogBuffer.length - 1, stamp: chunkStamp };
+      }
+      if (screenStr) term.write(screenStr);
+    }
+
+    /** @} */ // end of grp_rx
+
+    /**
+     * @defgroup grp_serial_io シリアル入出力
+     * @brief 受信ループと送信処理
+     * @{
+     */
+
+    /**
+     * @brief シリアルデータの非同期読み取りループ
+     * @details keepReadingFlag が true の間、受信データを handleIncomingData() へ渡し続ける。
+     *          切断時は Reader のキャンセルにより done となってループを抜ける。
+     * @return {Promise<void>}
+     */
     async function readLoop() {
-      while (port?.readable && keepReading) {
+      while (serialPort?.readable && keepReadingFlag) {
         try {
-          reader = port.readable.getReader();
+          serialReader = serialPort.readable.getReader();
           while (true) {
-            const { value, done } = await reader.read();
+            const { value, done } = await serialReader.read();
             if (done) break;
             if (value) {
               handleIncomingData(value);
             }
           }
-        } catch (e) { keepReading && term.writeln(`\r\n[エラー] ${e.message}\r\n`); }
-        finally { reader?.releaseLock(); }
+        } catch (e) {
+          if (keepReadingFlag) term.writeln(`\r\n[エラー] ${e.message}\r\n`);
+        } finally {
+          serialReader?.releaseLock();
+        }
       }
     }
 
-    async function send(txt) {
-      if (!port?.writable) return;
-      const w = port.writable.getWriter();
-      await w.write(new TextEncoder().encode(txt));
-      w.releaseLock();
+    /**
+     * @brief シリアルポートへテキストデータを送信する
+     * @details UTF-8 にエンコードして書き込む。未接続の場合は何もしない。
+     * @param {string} txt 送信文字列 (改行が必要な場合は呼び出し側で付与する)
+     * @return {Promise<void>}
+     */
+    async function sendDataToSerial(txt) {
+      if (!serialPort?.writable) return;
+      const writer = serialPort.writable.getWriter();
+      await writer.write(new TextEncoder().encode(txt));
+      writer.releaseLock();
     }
 
+    /** @} */ // end of grp_serial_io
+
     /**
-     * @brief クイック送信ドロップダウンUIの更新（最新20件・重複排除）
+     * @defgroup grp_history コマンド履歴
+     * @brief 履歴の保存とクイック送信プルダウンの更新、履歴呼び出し時の入力行置換
+     * @{
+     */
+
+    /**
+     * @brief クイック送信用プルダウンを履歴から再構築する
+     * @details 重複を除き、新しい順に最大 20 件を表示する。履歴が空なら「(履歴なし)」を表示する。
      */
     function updateQuickHistUI() {
       const sel = $('selQuickHist');
       sel.innerHTML = '';
-      const unique = [...new Set([...history].reverse())].slice(0, 20);
+      const unique = [...new Set([...commandHistory].reverse())].slice(0, 20);
       if (!unique.length) {
         sel.innerHTML = '<option value="">(履歴なし)</option>';
         return;
@@ -298,111 +628,203 @@
       });
     }
 
-    function pushHist(cmd) {
-      if (cmd && history[history.length - 1] !== cmd) {
-        history.push(cmd);
-        if (history.length > MAX_HIST) history.shift();
-        localStorage.setItem(KEY, JSON.stringify(history));
+    /**
+     * @brief コマンドを履歴へ追加し、localStorage へ保存する
+     * @details 直前と同じコマンド・空文字は追加しない。MAX_HISTORY_COUNT を超えた分は古い順に破棄する。
+     * @param {string} cmd 追加するコマンド
+     */
+    function pushHistory(cmd) {
+      if (cmd && commandHistory[commandHistory.length - 1] !== cmd) {
+        commandHistory.push(cmd);
+        if (commandHistory.length > MAX_HISTORY_COUNT) commandHistory.shift();
+        localStorage.setItem(LOCAL_STORAGE_KEY, JSON.stringify(commandHistory));
       }
-      histIdx = history.length;
+      historyIndex = commandHistory.length;
       updateQuickHistUI();
     }
 
+    /**
+     * @brief 履歴呼び出し時：現在画面上にある入力文字を消去し、新しい履歴文字列を描画する
+     * @param {string} newText 新しい履歴文字列 (空文字なら入力行を空にする)
+     */
     function replaceInputText(newText) {
-      if (cursorPos > 0) {
-        term.write(`\x1b[${cursorPos}D`);
+      if (currentCursorPos > 0) {
+        term.write(`\x1b[${currentCursorPos}D`);
       }
       term.write('\x1b[K');
 
-      curBuf = newText;
-      cursorPos = curBuf.length;
-      term.write(curBuf);
+      currentInputBuffer = newText;
+      currentCursorPos = currentInputBuffer.length;
+
+      term.write(currentInputBuffer);
     }
 
-    term.onData(async data => {
-      if (!port?.writable) return;
+    /** @} */ // end of grp_history
 
-      // ↑ 履歴 (前へ)
+    /**
+     * @defgroup grp_input キーボード入力
+     * @brief 行編集・Enter送信・コピー/キャンセルのキー処理
+     * @{
+     */
+
+    /**
+     * @brief キーボード入力ハンドラ (行編集・改行送信・エコー自動除外)
+     * @details
+     * 入力はデバイスへ即時送信せず、currentInputBuffer に溜めて Enter で一括送信する。
+     *  - ↑/↓ (ESC [ A / B)      : 履歴の前/次を呼び出す
+     *  - →/← (ESC [ C / D)      : カーソル移動
+     *  - Delete (ESC [ 3 ~)     : カーソル位置の文字を削除
+     *  - Backspace (0x7F / 0x08): カーソル左の文字を削除
+     *  - Enter (CR / LF)        : ログ記録 → 画面改行 → 送信 (LF のみ) → バッファ初期化
+     *  - 0x20 以上の文字         : カーソル位置へ挿入
+     * @param {string} data Xterm.js から渡される入力文字列 (エスケープシーケンス含む)
+     * @note 未接続の場合は何もしない。
+     */
+    term.onData(async data => {
+      if (!serialPort?.writable) return;
+
+      // 矢印キー（上：履歴前のコマンドへ）
       if (data === '\x1b[A') {
-        if (histIdx > 0) histIdx--;
-        replaceInputText(history[histIdx] ?? '');
+        if (commandHistory.length === 0) return;
+        if (historyIndex > 0) {
+          historyIndex--;
+        }
+        replaceInputText(commandHistory[historyIndex] ?? '');
         return;
       }
-      // ↓ 履歴 (次へ)
+      // 矢印キー（下：履歴次のコマンドへ）
       if (data === '\x1b[B') {
-        if (histIdx < history.length) histIdx++;
-        replaceInputText(history[histIdx] ?? '');
+        if (commandHistory.length === 0) return;
+        if (historyIndex < commandHistory.length - 1) {
+          historyIndex++;
+          replaceInputText(commandHistory[historyIndex] ?? '');
+        } else {
+          historyIndex = commandHistory.length;
+          replaceInputText('');
+        }
         return;
       }
-      // → カーソル右
+      // 矢印キー（右）
       if (data === '\x1b[C') {
-        if (cursorPos < curBuf.length) {
-          cursorPos++;
+        if (currentCursorPos < currentInputBuffer.length) {
+          currentCursorPos++;
           term.write('\x1b[C');
         }
         return;
       }
-      // ← カーソル左
+      // 矢印キー（左）
       if (data === '\x1b[D') {
-        if (cursorPos > 0) {
-          cursorPos--;
+        if (currentCursorPos > 0) {
+          currentCursorPos--;
           term.write('\x1b[D');
         }
         return;
       }
-      // Del キー (\x1b[3~)
+      // Deleteキー
       if (data === '\x1b[3~') {
-        if (cursorPos < curBuf.length) {
-          const left = curBuf.slice(0, cursorPos);
-          const right = curBuf.slice(cursorPos + 1);
-          curBuf = left + right;
-          
+        if (currentCursorPos < currentInputBuffer.length) {
+          const left = currentInputBuffer.slice(0, currentCursorPos);
+          const right = currentInputBuffer.slice(currentCursorPos + 1);
+          currentInputBuffer = left + right;
           term.write(right + ' \x1b[' + (right.length + 1) + 'D');
         }
         return;
       }
 
+      // 通常・特殊キーのループ処理
       for (const c of data) {
         const code = c.charCodeAt(0);
-        if (code === 13 || code === 10) { // Enter
-          const trimmed = curBuf.trim();
+        if (code === 13 || code === 10) {
+          // --- Enterキー押下時 ---
+          const trimmed = currentInputBuffer.trim();
           if (trimmed) {
-            term.write('\r\n');
-            pushHist(trimmed);
-            await send(curBuf + '\n');
-          } else {
-            await send('\n');
+            pushHistory(trimmed);
           }
-          curBuf = '';
-          cursorPos = 0;
-        } else if (code === 127 || code === 8) { // Backspace
-          if (cursorPos > 0) {
-            const left = curBuf.slice(0, cursorPos - 1);
-            const right = curBuf.slice(cursorPos);
-            curBuf = left + right;
-            cursorPos--;
-            
+          
+          // 相手から返ってくる予定のエコー文字列をセット（自動除外用）
+          expectedEchoString = currentInputBuffer;
+
+          // ログへ記録し、画面上で改行して、マイコンへ一括送信（※CRは送信せず LF(\n) のみ送信）
+          // ※ logUserCommand() は画面の改行より前に呼ぶ（プロンプト行の時刻を送信時刻へ差し替えるため）
+          logUserCommand(currentInputBuffer);
+          term.write('\r\n');
+          screenAtLineStart = true;
+          await sendDataToSerial(currentInputBuffer + '\n');
+          
+          // 入力バッファと履歴インデックスをリセット
+          currentInputBuffer = '';
+          currentCursorPos = 0;
+          historyIndex = commandHistory.length;
+        } else if (code === 127 || code === 8) {
+          // --- Backspace キー ---
+          if (currentCursorPos > 0) {
+            const left = currentInputBuffer.slice(0, currentCursorPos - 1);
+            const right = currentInputBuffer.slice(currentCursorPos);
+            currentInputBuffer = left + right;
+            currentCursorPos--;
             term.write('\x1b[D' + right + ' \x1b[' + (right.length + 1) + 'D');
           }
-        } else if (code >= 32) { // 通常文字の挿入
-          const left = curBuf.slice(0, cursorPos);
-          const right = curBuf.slice(cursorPos);
-          curBuf = left + c + right;
-          cursorPos++;
-          
+        } else if (code >= 32) {
+          // --- 通常の文字入力 ---
+          const left = currentInputBuffer.slice(0, currentCursorPos);
+          const right = currentInputBuffer.slice(currentCursorPos);
+          currentInputBuffer = left + c + right;
+          currentCursorPos++;
           term.write(c + right);
           if (right.length > 0) {
             term.write(`\x1b[${right.length}D`);
           }
-        } else if (code === 3) { // Ctrl+C
-          curBuf = '';
-          cursorPos = 0;
-          term.write('^C\r\n');
-          await send('\x03');
         }
       }
     });
 
+    /**
+     * @brief Xterm.js カスタムキーハンドラ (コピーと入力キャンセル用)
+     * @details
+     * Ctrl/Cmd+C のみを処理する。
+     *  - テキスト選択あり: クリップボードへコピーする
+     *  - 選択なし        : 入力中の内容を破棄し、割り込み (0x03) を送信する
+     * @param {KeyboardEvent} e キーイベント
+     * @return {boolean} false で Xterm.js 側の既定処理を抑止、true で通常処理を継続
+     * @note Ctrl+V (貼り付け) は仕様上、独自処理しない。
+     */
+    term.attachCustomKeyEventHandler(async (e) => {
+      if (e.type !== 'keydown') return true;
+
+      const isCtrlOrCmd = e.ctrlKey || e.metaKey;
+      const key = e.key.toLowerCase();
+
+      if (isCtrlOrCmd && key === 'c') {
+        if (term.hasSelection()) {
+          const selectedText = term.getSelection();
+          try {
+            await navigator.clipboard.writeText(selectedText);
+          } catch (err) {
+            console.error('コピー失敗:', err);
+          }
+          return false;
+        } else {
+          if (serialPort?.writable) {
+            currentInputBuffer = '';
+            currentCursorPos = 0;
+            historyIndex = commandHistory.length;
+            expectedEchoString = '';
+            term.write('^C\r\n');
+            screenAtLineStart = true;
+            const writer = serialPort.writable.getWriter();
+            await writer.write(new TextEncoder().encode('\x03')); // 割り込みシグナル (Ctrl+C = 0x03)
+            writer.releaseLock();
+          }
+          return false;
+        }
+      }
+
+      return true;
+    });
+
+    /** @} */ // end of grp_input
+
+    // 初期起動時の履歴UI構築
     updateQuickHistUI();
   </script>
 </body>
