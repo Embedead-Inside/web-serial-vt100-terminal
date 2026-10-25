@@ -329,15 +329,23 @@
 
     /**
      * @brief 「送信」ボタン押下時の処理 (プルダウンからのクイック送信)
-     * @details 選択中のコマンドを履歴・ログへ記録し、LF(\n) のみを付けて送信する。
-     * @note 画面にはコマンドを表示しない (エコーバックは除去されるため)。ログにのみ記録される。
+     * @details
+     * 選択中のコマンドを履歴・ログへ記録し、画面にも表示したうえで、LF(\n) のみを付けて送信する。
+     * 入力途中の文字がある場合は、それを消してプルダウンのコマンドに置き換える。
+     * 処理の流れは Enter キー押下時 (grp_input) と同じ。
+     * @warning logUserCommand() は、画面を書き換える (replaceInputText / 改行) より前に呼ぶこと。
      */
     $('btnQuickSend').onclick = async () => {
       const val = $('selQuickHist').value;
       if (!val) return;
       pushHistory(val);
       expectedEchoString = val;
+      // ログへ記録（プロンプト行の時刻を送信時刻へ差し替えるため、画面の更新より前に呼ぶ）
       logUserCommand(val);
+      // 入力途中の文字を消してコマンドを画面に表示し、改行する
+      replaceInputText(val);
+      term.write('\r\n');
+      screenAtLineStart = true;
       currentInputBuffer = '';
       currentCursorPos = 0;
       await sendDataToSerial(val + '\n');
